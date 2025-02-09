@@ -1,0 +1,1156 @@
+---
+title: "ProjectBaldiniMele_new"
+output: pdf_document
+date: "2024-12-02"
+---
+
+```{r setup, include=FALSE}
+
+setwd("C:/Users/aless/OneDrive/Università/Ensiie/Regression Regularisée/Projet")
+info = load("mrr_proj_bio.RData")
+library(dplyr)
+library(ggplot2)
+library(MASS)
+library(glmnet)
+library(sandwich)
+
+```
+
+### Biology Project: grain.number
+
+Genome-wide association studies (GWAS) aim to identify genetic associations with phenotypes by analyzing differences in allele frequencies among genetically similar individuals with different traits. In this context, the study focuses on wheat plant phenotypes, specifically examining genotypes to understand genetic origins of phenotypic variations over time. By identifying high-quality individuals with desirable traits, such as higher yield or resistance to drought and heat, these studies could provide valuable insights for current and future agricultural challenges. Here, the goal is to investigate the genetic basis of grain production under varying environmental conditions, such as drought or heat, by studying SNPs (single-nucleotide polymorphisms) and identifying blocks of correlated SNPs associated with grain yield.
+
+### The dataset
+#### df1:
+Each *row* represents an individual, while each *column* corresponds to a specific SNP. Values of 0, 1, or 2 indicate the genotype: 0 for homozygous reference alleles, 1 for heterozygous alleles, and 2 for homozygous variant alleles.
+
+#### pheno:
+Each row in the *pheno* database represents an individual, with columns providing data on the sample identification, experiment details (Experiment, parent1, Code_ID, Accession_ID, geno.panel), yield-related traits (grain.yield, grain.number, seed.size), growth characteristics (plant.height, tassel.height, ear.height), and reproductive timing (anthesis, silking). Environmental conditions include *scenarioWater*, *scenarioTemp*, and *scenarioFull*, while *loc* and *year* indicate the experiment’s time and place. *geneticGroup* defines a set of organisms with similar genetic traits.  
+
+#### geno:
+In the *geno* database, each *column* represents a SNP (identified by a unique code) linked to specific genetic positions (loci), while each *row* represents an individual with an identifying code. Each cell contains a value (0, 1, or 2) indicating the individual’s genotype for that SNP: 0 means homozygous for the reference alleles, 1 means heterozygous (one reference, one variant allele), and 2 means homozygous for the variant alleles.  
+
+#### geno_map:
+Each *row* represents a single SNP and includes the following data in the *columns*:  
+*SNP.names* SNP identifier.  
+*chr* chromosome number.  
+*pos* SNP position in bases from the chromosome's end.  
+*allele1* first nitrogenous base, A, T, C, or G.  
+*allele2* second nitrogenous base, which may match or differ from allele1. 
+
+#### To sum up
+The sample is made of 2460 observations, for which we know phenotypes and environmental situations in which the experiment took place (in pheno) and the SPN with the genotypes with respect to the reference allele (in df1).
+Then, for each SPN we have some characteristics with respect to their position and genetic variability (in geno_map) and for each genotype the allelic status (homozigote or heterozigote) for each SNP (geno).
+
+```{r}
+#Regression Dataset Creation
+
+sum
+df1=df1[, -c(41724:41742)]
+dataset_int=cbind(pheno, df1)
+dataset_int=dataset_int[, -c(9, 13, 21)] #Removal of double genotype, and tassel.height and seed.size that have na values
+
+dataset_int$scenarioTemp[dataset_int$scenarioTemp == "Hot" | dataset_int$scenarioTemp == "Hot(Day)"] <- "Hot"
+
+dataset_eff= dataset_int[, -c(2:7, 9:14, 17, 19, 21)] #Removal all useless variables
+```
+
+```{r}
+#General comprehension of the dataset and cleaning
+df1 = na.omit(df1)
+geno = na.omit(geno)
+geno_map = na.omit(geno_map)
+pheno = na.omit(pheno)
+dataset_eff = na.omit(dataset_eff)
+dataset_int=na.omit(dataset_int)
+nunique = length (unique(df1$genotype))
+nunique # coherent with the number of rows in geno
+
+```
+
+
+We have created our dataset containing external factors and SNPs. When omitting NA values we get a new dataset with half of the observations.
+
+```{r, fig.width=7, fig.height=3}
+# Summary of data
+summary(dataset_eff$grain.number)
+# Histogram
+hist(dataset_eff$grain.number, main="Grain Number distribution", xlab="grain.number")
+
+```
+The histogram shows the distribution of grain numbers, with the highest frequencies concentrated between 2000 and 4000. The data appears roughly symmetric, with fewer occurrences above 5000, suggesting potential outliers and clusters.
+
+### Outliers detection
+
+```{r}
+#Outliers cleaning
+
+outlier_experiment <- pheno %>%
+  group_by(Experiment) %>%
+  mutate(
+    Q1_exp = quantile(grain.number, 0.25),
+    Q3_exp = quantile(grain.number, 0.75),
+    IQR_exp = IQR(grain.number),
+    lower_bound_exp = Q1_exp - 1.5 * IQR_exp,
+    upper_bound_exp = Q3_exp + 1.5 * IQR_exp,
+    is_outlier_exp = grain.number < lower_bound_exp | grain.number > upper_bound_exp
+  )
+
+outlier_genotype <- outlier_experiment %>%
+  group_by(genotype) %>%
+  mutate(
+    Q1_gen = quantile(grain.number, 0.25),
+    Q3_gen = quantile(grain.number, 0.75),
+    IQR_gen = IQR(grain.number),
+    lower_bound_gen = Q1_gen - 1.5 * IQR_gen,
+    upper_bound_gen = Q3_gen + 1.5 * IQR_gen,
+    is_outlier_gen = grain.number < lower_bound_gen | grain.number > upper_bound_gen
+  )
+
+outliers <- outlier_genotype %>% filter(is_outlier_exp & is_outlier_gen)
+clean_data <- outlier_genotype %>%
+  filter(!(is_outlier_exp & is_outlier_gen))
+
+print(outliers)
+```
+
+Outliers were identified based on the IQR method at both the experiment and genotype levels. After applying the filtering criteria, no outliers were detected, indicating a clean dataset for further analysis.
+
+```{r,fig.width=6, fig.height=3}
+#Scenario and experiment
+
+dataset_int$scenario_num<-case_when(
+  dataset_int$scenarioFull=='WW.Cool'~ 1,
+  dataset_int$scenarioFull=='WD.Cool'~ 2,
+  dataset_int$scenarioFull%in% c('WW.Hot', 'WW.Hot(Day)')~ 3,
+  dataset_int$scenarioFull%in% c('WD.Hot', 'WD.Hot(Day)')~ 4,
+)
+
+counts <- dataset_int %>%
+  group_by(Experiment, scenario_num) %>%
+  summarise(count = n(), .groups = "drop")
+
+
+ggplot(counts, aes(x = Experiment, y = count, fill = as.factor(scenario_num))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(
+    values = c("blue", "green", "orange", "red"),
+    labels = c("1" = "WW.Cool", "2" = "WD.Cool", "3" = "WW.Hot", "4" = "WD.Hot")) + labs(
+    title = "Scenario for experiment",
+    x = "Experiment",
+    y = "Frequence",
+    fill = "Scenario"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+In this analysis, we categorized scenarios into numeric codes using case_when, assigning values based on the scenario descriptions (e.g., "WW.Cool" as 1, "WD.Hot" as 4). We then grouped the data by experiment and scenario, calculating the count for each group. The bar plot visualizes these counts, with distinct colors representing different scenarios. This visualization helps compare scenario frequencies across experiments.
+
+We can see that 10 experiments were conducted 
+and each experiment took place under a different scenario.
+
+### SMALLER DATASET CREATION ###
+
+```{r}
+#We represents separately all the possible scenario
+
+HotWD_set <- subset(dataset_eff, dataset_eff$scenarioTemp == "Hot" & dataset_eff$scenarioWater == "WD")
+HotWW_set <- subset(dataset_eff, dataset_eff$scenarioTemp == "Hot" & dataset_eff$scenarioWater == "WW")
+CoolWW_set <- subset(dataset_eff, dataset_eff$scenarioTemp == "Cool" & dataset_eff$scenarioWater == "WW")
+
+```
+
+```{r}
+#Statistics on the scenario
+
+# Summary of data Cool
+summary(CoolWW_set$grain.number)
+# Histogram Cool
+hist(CoolWW_set$grain.number, main="Grain Number - Cool WW", xlab="grain.number")
+
+# Summary of data HotWW
+summary(HotWW_set$grain.number)
+# Histogram Cool
+hist(HotWW_set$grain.number, main="Grain Number - Hot WW", xlab="grain.number")
+
+# Summary of data HotWD
+summary(HotWD_set$grain.number)
+# Histogram Cool
+hist(HotWD_set$grain.number, main="Grain Number - Hot WD", xlab="grain.number")
+
+```
+
+In this analysis, we separated the dataset into three subsets based on specific combinations of temperature ("Hot" or "Cool") and water scenarios ("WW" or "WD"). For each subset, we performed statistical summaries and visualized the grain number distribution with histograms.
+
+- The histogram for **Cool WW** shows an approximately normal distribution with grain numbers ranging between 2000 and 6000.  
+
+- The histogram for **Hot WW** also displays a roughly normal distribution, though slightly wider, with values ranging from 1000 to 6000.
+
+- The **Hot WD** scenario exhibits a bimodal distribution, with two distinct peaks: one just before 1000 and the other just after 2000. Values range between 0 and 4000, indicating a more complex response pattern under these conditions.  
+
+These insights highlight differences in grain number distributions under varying environmental scenarios.
+
+We suspect the possibility of clustering in HotWD.
+
+```{r}
+#Search for the clusters in hot_WD
+
+set.seed(123)  
+kmeans_result <- kmeans(HotWD_set$grain.number, centers = 2)
+HotWD_set$cluster <- kmeans_result$cluster
+ggplot(HotWD_set, aes(x = grain.number, fill = as.factor(cluster))) + geom_histogram(position = "identity", bins = 30) + labs(title = "Distribution of the number of grains in clusters", x = "Number of grains", y = "Frequency", fill = "Cluster") + theme_minimal()
+
+HotWD_set_1 <- HotWD_set[HotWD_set$cluster==1,]
+HotWD_set_2 <- HotWD_set[HotWD_set$cluster==2,]
+
+summary(HotWD_set_1$grain.number)
+hist(HotWD_set_1$grain.number, main="Grain Number - Hot WD 1", xlab="grain.number")
+
+summary(HotWD_set_2$grain.number)
+hist(HotWD_set_2$grain.number, main="Grain Number - Hot WD 2", xlab="grain.number")
+
+
+```
+In this analysis, we applied k-means clustering with two clusters to the grain number data from the Hot WD scenario to investigate potential groupings within the bimodal distribution. The results revealed two clusters:
+
+- Cluster 1 spans grain numbers between 1500 and 3000, with a longer right tail that reach 4000 and a mean of approximately 2300;
+- Cluster 2 includes grain numbers from 0 to about 1500, with a mean of approximately 680.
+
+When visualizing the two clusters separately, their distributions appear roughly normal. Cluster 1 is concentrated between 1500 and 3000, with some values over 3000 up to 4000, while Cluster 2 is focused between 0 and 1500. This clustering aligns with the bimodal pattern observed earlier and suggests distinct responses within the data, possibly reflecting different subgroups or underlying biological factors. This approach effectively captures the structure in the data and confirms the existence of two distinct patterns.
+It has to be noticed that the least regular distribution, so that the one that appears in hotWD with the presence of two clusters, is associated to hot and dry weather, that is usually the most difficult for the plant to live in, suggesting an irregularity of behavior in case of extreme weather conditions.
+
+###VARIABLE SELECTION USING CORRELATION WITH THE TARGET VARIABLE###
+
+```{r}
+SNPs_coolWW <- CoolWW_set[, 6:41725]
+env_var_coolWW <- CoolWW_set[, 3:4]  
+target_coolWW <- CoolWW_set$grain.number
+
+SNPs_hotWW <- HotWW_set[, 6:41725]
+env_var_hotWW <- HotWW_set[, 3:4]  
+target_hotWW <- HotWW_set$grain.number
+
+SNPs_hotWD <- HotWD_set[, 6:41725]
+env_var_hotWD <- HotWD_set[, 3:4]  
+target_hotWD <- HotWD_set$grain.number
+
+SNPs_hotWD_1 <- HotWD_set_1[, 6:41725]
+env_var_hotWD_1 <- HotWD_set_1[, 3:4]  
+target_hotWD_1 <- HotWD_set_1$grain.number
+
+SNPs_hotWD_2 <- HotWD_set_2[, 6:41725]
+env_var_hotWD_2 <- HotWD_set_2[, 3:4]  
+target_hotWD_2 <- HotWD_set_2$grain.number
+
+SNPs <- dataset_eff[, 6:41725]
+env_var <- dataset_eff[, 3:4]
+target <- dataset_eff$grain.number
+
+select_snps <- function(SNPs_data, target_data, env_var=NULL) {
+  
+  target_standardized <- (target_data - mean(target_data)) / sd(target_data)
+  
+  correlations <- numeric(ncol(SNPs_data))
+  
+  for (i in 1:ncol(SNPs_data)) {
+    correlations[i] <- cor(target_standardized, SNPs_data[[i]])
+  }
+  
+  threshold <- ceiling(3*nrow(SNPs_data) / log(nrow(SNPs_data))) 
+  
+  sorted_snps <- order(abs(correlations), decreasing = TRUE)
+  
+  top_snps <- sorted_snps[1:threshold]
+  
+  selected_snp_names <- colnames(SNPs_data)[top_snps]
+  
+  SNPs_selected <- SNPs_data[, selected_snp_names]
+  
+  grain.number=target_data
+  
+  if (!is.null(env_var)) {
+    env_var <- data.frame(lapply(env_var, as.factor))  
+    data_name <- cbind(grain.number, env_var, SNPs_selected)}
+  else {
+    data_name <- cbind(grain.number, SNPs_selected)}
+  
+  #Identical columns removal
+
+  duplicated_columns <- duplicated(as.list(data_name))
+
+  duplicate_column_names <- names(data_name)[duplicated_columns]
+
+  data_name <- data_name[, !duplicated_columns]
+
+  return(data_name)
+}
+
+cool_WW<-select_snps(SNPs_coolWW, target_coolWW)
+hot_WW<-select_snps(SNPs_hotWW, target_hotWW)
+hot_WD<-select_snps(SNPs_hotWD, target_hotWD)
+hot_WD_1<-select_snps(SNPs_hotWD_1, target_hotWD_1)
+hot_WD_2<-select_snps(SNPs_hotWD_2, target_hotWD_2)
+data<-select_snps(SNPs, target, env_var)
+```
+
+In this section, we perform variable selection to identify the most relevant SNPs (Single Nucleotide Polymorphisms) associated with the target variable, which is the grain number for each subset of the data (representing different scenarios).
+
+1. *Data Preparation*: For each scenario (Cool WW, Hot WW, Hot WD, and their respective clusters), we extract the relevant columns:
+  SNPs_data (the SNP data from columns 6 to 41725),
+  env_var (environmental variables, columns 3 to 4),
+  target_data (the target variable, grain.number).
+2. *Standardization*: The target variable (grain.number) is standardized to have a mean of 0 and a standard deviation of 1.
+3. *Correlation Calculation*: For each SNP, the correlation with the standardized target variable is calculated. This helps in identifying which SNPs are most correlated with the grain number.
+4. *Selection Threshold*: A threshold is set based on the number of rows in the SNP data to select the most highly correlated SNPs. The threshold is calculated as 3 * number of rows / log(number of rows), which helps limit the number of selected SNPs based on the dataset size. 
+(We found this threshold in the scientific paper read in class)
+5. *Top SNP Selection*: SNPs are sorted by their absolute correlation values, and the top SNPs are selected based on the threshold.
+6. *Environment and SNPs Integration*: If environmental variables are provided, they are combined with the selected SNPs and the target variable to create a final dataset (data_name). Duplicate columns are removed from the dataset.
+7. *Function Application*: The select_snps function is applied to each dataset producing selected SNPs for each set. This results in cleaned datasets with only the most relevant SNPs for further analysis.
+
+In summary, this approach allows for the selection of a subset of SNPs that have the highest correlation with the target variable, helping to focus on the most important features for further modeling or analysis.
+
+The optimal number of variable selected by the function should be selected according to data features, and empirically is around n/log(n). Since the intention of this study was to be more informative as possible in the definition of data regressors, the threshold has been set to 3*n/log(n), as higher values would have made computation too complex.
+
+#LINEAR REGRESSION AND PENALIZED REGRESSION MODEL
+
+```{r}
+#Linear Regression on the entire dataset
+
+lm_data<-lm(grain.number~ ., data = data)
+summary(lm_data, vcov=vcovHC)
+plot(data$grain.number, lm_data$fitted.values, xlab="Grain number", ylab="Fitted Values")
+abline(0,1, col="red")
+plot(lm_data$residuals, ylab="Residuals")
+abline(0,0, col="red")
+plot(data$grain.number, lm_data$residuals, xlab="Grain number", ylab="Residuals")
+abline(0,0, col="red")
+```
+The linear regression model showed strong significance for the variables "scenarioWaterWW" and "scenarioTempHot," which positively and negatively influence wheat yield, respectively. However, many of the predictor variables were not significant, suggesting collinearity or lack of variability in some factors.
+
+```{r}
+#Lasso on the entire dataset
+
+#Variables definition
+target_data=as.numeric(data$grain.number)
+SNPs_data <- data[, -which(names(data) == "grain.number")]
+SNPs_data<-as.matrix(SNPs_data)
+
+#Lasso and Cross-validation
+cv_model_data <- cv.glmnet(SNPs_data, target_data, alpha = 1)
+best_lambda_data <- cv_model_data$lambda.min
+print(best_lambda_data)
+
+#Results
+best_coef_data <- coef(cv_model_data, s = "lambda.min")
+print(best_coef_data)
+
+#Graphs
+predicted_values_data <- predict(cv_model_data, newx = SNPs_data, s = "lambda.min")
+residuals_data <- target_data - predicted_values_data
+plot(residuals_data, main = "Residuals of Lasso Model", ylab = "Residuals", xlab = "Index")
+abline(h = 0, col = "red")
+plot(target_data, predicted_values_data, main = "Fitted of Lasso Model", ylab = "Residuals", xlab = "Target")
+abline(0, 1, col = "red")
+plot(target_data, residuals_data, main = "Residuals of Lasso Model", ylab = "Residuals", xlab = "Index")
+abline(h = 0, col = "red")
+
+```
+
+```{r}
+#Forward on entire dataset
+
+forward_data<- step(lm_data,direction="forward")
+summary(forward_data)
+plot(data$grain.number, forward_data$fitted.values)
+abline(0,1, col="red")
+plot(forward_data$residuals)
+abline(0,0, col="red")
+plot(data$grain.number, forward_data$residuals)
+abline(0,0, col="red")
+```
+Possible presence of clusters and linearity of residuals. We should analyse  each cluster previously defined. We search in clusters divided according to environmental conditions.
+
+#REGRESSION ON SUBSETS - CoolWW
+
+```{r}
+#Standard Regression Cool
+
+lm_coolWW<-lm(grain.number~ ., data = cool_WW)
+summary(lm_coolWW, vcoc=vcovHC)
+
+#Graphs
+plot(cool_WW$grain.number, lm_coolWW$fitted.values, ylab = "Fitted Values", xlab = "Grain Number")
+abline(0,1, col="red")
+plot(lm_coolWW$residuals, ylab = "Residuals", xlab = "Index")
+abline(0,0, col="red")
+plot(cool_WW$grain.number, lm_coolWW$residuals, ylab = "Residuals", xlab = "Index")
+abline(0,0, col="red")
+```
+Adjusted R2: 0.4411
+
+```{r}
+#Lasso on Cool
+
+#Variables definition
+target_coolWW <- as.numeric(cool_WW$grain.number)
+SNPs_coolWW <- cool_WW[, -which(names(cool_WW) == "grain.number")]
+SNPs_coolWW<-as.matrix(SNPs_coolWW)
+
+#Lasso and Cross-validation
+cv_model_coolWW <- cv.glmnet(SNPs_coolWW, target_coolWW, alpha = 1)
+best_lambda_coolWW <- cv_model_coolWW$lambda.min
+print(best_lambda_coolWW)
+
+#Results
+best_coef_coolWW <- coef(cv_model_coolWW, s = "lambda.min")
+print(best_coef_coolWW)
+
+#Graphs
+predicted_values_coolWW <- predict(cv_model_coolWW, newx = SNPs_coolWW, s = "lambda.min")
+residuals_coolWW <- target_coolWW - predicted_values_coolWW
+plot(residuals_coolWW, main = "Residuals of Lasso Model", ylab = "Residuals", xlab = "Index")
+abline(h = 0, col = "red")
+plot(target_coolWW, predicted_values_coolWW, main = "Fitted of Lasso Model", ylab = "Residuals", xlab = "Target")
+abline(0, 1, col = "red")
+plot(target_coolWW, residuals_coolWW, main = "Residuals of Lasso Model", ylab = "Residuals", xlab = "Index")
+abline(h = 0, col = "red")
+
+```
+Linear results for residuals
+
+We continue the analysis only with variables that are lasso results
+```{r}
+#Dataset coolWW reduction for lasso
+
+selected_variables_coolWW <- rownames(best_coef_coolWW)[best_coef_coolWW[, 1] != 0]
+selected_variables_coolWW <- selected_variables_coolWW[selected_variables_coolWW != "(Intercept)"]
+
+cool_WW <- cool_WW[, c("grain.number", selected_variables_coolWW)]
+```
+
+
+```{r}
+#Standard Regression on reduced cool
+
+lm_new_coolWW<-lm(grain.number~ ., data = cool_WW)
+summary(lm_new_coolWW, vcoc=vcovHC)
+
+#Graphs
+plot(cool_WW$grain.number, lm_new_coolWW$fitted.values)
+abline(0,1, col="red")
+plot(lm_new_coolWW$residuals)
+abline(0,0, col="red")
+plot(cool_WW$grain.number, lm_new_coolWW$residuals)
+abline(0,0, col="red")
+```
+
+
+```{r}
+#Backward Cool (Same results as Stepwise)
+
+backward_coolWW <- step(lm_new_coolWW, direction="backward")
+summary(backward_coolWW, vcov=vcovHC)
+
+#Graphs
+plot(cool_WW$grain.number, backward_coolWW$fitted.values, ylab = "Fitted Values", xlab = "Grain Number")
+abline(0,1, col="red")
+plot(backward_coolWW$residuals, ylab = "Residuals")
+abline(0,0, col="red")
+plot(cool_WW$grain.number, backward_coolWW$residuals, ylab = "Residuals", xlab = "Grain Number")
+abline(0,0, col="red")
+```
+Adjusted R2: 0.4815
+
+Still some linearity in residuals, both in backward and entire model.
+
+```{r}
+#Forward cool
+
+forward_coolWW <- step(lm_new_coolWW, direction="forward")
+summary(forward_coolWW, vcov=vcovHC)
+
+#Graphs
+plot(cool_WW$grain.number, forward_coolWW$fitted.values)
+abline(0,1, col="red")
+plot(forward_coolWW$residuals)
+abline(0,0, col="red")
+plot(cool_WW$grain.number, forward_coolWW$residuals)
+abline(0,0, col="red")
+```
+
+Very weak results with forward in terms of significativity
+```{r}
+#Stepwise cool
+
+step_coolWW <- step(lm_new_coolWW,direction="both")
+summary(step_coolWW)
+
+#Graphs
+plot(cool_WW$grain.number, step_coolWW$fitted.values)
+abline(0,1, col="red")
+plot(step_coolWW$residuals)
+abline(0,0, col="red")
+plot(cool_WW$grain.number, step_coolWW$residuals)
+abline(0,0, col="red")
+```
+Same results as Backward
+
+```{r}
+#Common Results ABckward and Standard Linear Model
+
+# P-values Cool
+
+pvalues_lm_coolWW <- summary(lm_coolWW)$coefficients[, 4]
+pvalues_backward_coolWW <- summary(backward_coolWW)$coefficients[, 4]
+
+# Variables selection
+vars_lm_coolWW <- names(pvalues_lm_coolWW)[pvalues_lm_coolWW < 0.05]
+vars_backward_coolWW <- names(pvalues_backward_coolWW)[pvalues_backward_coolWW < 0.05]
+
+# Common Variables
+common_vars_coolWW <- intersect(vars_lm_coolWW, vars_backward_coolWW)
+
+print(common_vars_coolWW)
+
+estimates_lm_coolWW <- summary(lm_coolWW)$coefficients[common_vars_coolWW, 1]
+estimates_backward_coolWW <- summary(backward_coolWW)$coefficients[common_vars_coolWW, 1]
+
+print(estimates_lm_coolWW)
+print("____")
+print(estimates_backward_coolWW)
+```
+
+
+#REGRESSION ON SUBSETS - HotWW
+
+```{r}
+#Standard Regression Hot
+
+lm_hotWW<-lm(grain.number~ ., data = hot_WW)
+summary(lm_hotWW, vcoc=vcovHC)
+
+#Graphs
+plot(hot_WW$grain.number, lm_hotWW$fitted.values, ylab = "Fitted Values", xlab = "Grain Number")
+abline(0,1, col="red")
+plot(lm_hotWW$residuals, ylab = "Residuals")
+abline(0,0, col="red")
+plot(hot_WW$grain.number, lm_hotWW$residuals, ylab = "Residuals", xlab = "Grain Number")
+abline(0,0, col="red")
+```
+Adjusted R2: 0.3601
+Linearity of residuals
+
+```{r}
+#Lasso on HotWW
+
+#Variables definition
+target_hotWW <- as.numeric(hot_WW$grain.number)
+SNPs_hotWW <- hot_WW[, -which(names(hot_WW) == "grain.number")]
+SNPs_hotWW<-as.matrix(SNPs_hotWW)
+
+#Lasso and Cross-validation
+cv_model_hotWW <- cv.glmnet(SNPs_hotWW, target_hotWW, alpha = 1)
+best_lambda_hotWW <- cv_model_hotWW$lambda.min
+print(best_lambda_hotWW)
+
+#Results
+best_coef_hotWW <- coef(cv_model_hotWW, s = "lambda.min")
+print(best_coef_hotWW)
+
+#Graphs
+predicted_values_hotWW <- predict(cv_model_hotWW, newx = SNPs_hotWW, s = "lambda.min")
+residuals_hotWW <- target_hotWW - predicted_values_hotWW
+plot(residuals_hotWW, main = "Residuals of Lasso Model", ylab = "Residuals", xlab = "Index")
+abline(h = 0, col = "red")
+plot(target_hotWW, predicted_values_hotWW, main = "Fitted of Lasso Model", ylab = "Residuals", xlab = "Target")
+abline(0, 1, col = "red")
+plot(target_hotWW, residuals_hotWW, main = "Residuals of Lasso Model", ylab = "Residuals", xlab = "Index")
+abline(h = 0, col = "red")
+
+```
+Also here linear results for residuals
+
+```{r}
+#Dataset hotWW reduction for lasso
+
+selected_variables_hotWW <- rownames(best_coef_hotWW)[best_coef_hotWW[, 1] != 0]
+selected_variables_hotWW <- selected_variables_hotWW[selected_variables_hotWW != "(Intercept)"]
+
+hot_WW <- hot_WW[, c("grain.number", selected_variables_hotWW)]
+```
+
+
+```{r}
+#Standard Regression on reduced hotWW
+
+lm_new_hotWW<-lm(grain.number~ ., data = hot_WW)
+summary(lm_new_hotWW, vcoc=vcovHC)
+
+#Graphs
+plot(hot_WW$grain.number, lm_new_hotWW$fitted.values)
+abline(0,1, col="red")
+plot(lm_new_coolWW$residuals)
+abline(0,0, col="red")
+plot(hot_WW$grain.number, lm_new_hotWW$residuals)
+abline(0,0, col="red")
+```
+
+
+```{r}
+#Backward HotWW (Same results as Stepwise)
+
+backward_hotWW <- step(lm_new_hotWW, direction="backward")
+summary(backward_hotWW, vcov=vcovHC)
+
+#Graphs
+plot(hot_WW$grain.number, backward_hotWW$fitted.values, ylab = "Fitted Values", xlab = "Grain Number")
+abline(0,1, col="red")
+plot(backward_hotWW$residuals, ylab = "Residuals")
+abline(0,0, col="red")
+plot(hot_WW$grain.number, backward_hotWW$residuals, ylab = "Residuals", xlab = "Grain Number")
+abline(0,0, col="red")
+```
+Adjusted R2: 0.397
+Residuals not too bad
+
+```{r}
+#Forward hotWW
+
+forward_hotWW <- step(lm_new_hotWW, direction="forward")
+summary(forward_hotWW, vcov=vcovHC)
+
+#Graphs
+plot(hot_WW$grain.number, forward_hotWW$fitted.values)
+abline(0,1, col="red")
+plot(forward_hotWW$residuals)
+abline(0,0, col="red")
+plot(hot_WW$grain.number, forward_hotWW$residuals)
+abline(0,0, col="red")
+```
+Worse residuals and Adjusted R2: 0.3846
+
+```{r}
+#Stepwise hotWW
+
+step_hotWW <- step(lm_new_hotWW, direction="both")
+summary(step_hotWW, vcov=vcovHC)
+
+#Graphs
+plot(hot_WW$grain.number, step_hotWW$fitted.values)
+abline(0,1, col="red")
+plot(step_hotWW$residuals)
+abline(0,0, col="red")
+plot(hot_WW$grain.number, step_hotWW$residuals)
+abline(0,0, col="red")
+```
+Same as Backward
+
+```{r}
+#Common Results Backward and Standard Linear Model
+
+# P-values hotWW
+
+pvalues_lm_hotWW <- summary(lm_hotWW)$coefficients[, 4]
+pvalues_backward_hotWW <- summary(backward_hotWW)$coefficients[, 4]
+
+# Variables selection
+vars_lm_hotWW <- names(pvalues_lm_hotWW)[pvalues_lm_hotWW < 0.05]
+vars_backward_hotWW <- names(pvalues_backward_hotWW)[pvalues_backward_hotWW < 0.05]
+
+# Common Variables
+common_vars_hotWW <- intersect(vars_lm_hotWW, vars_backward_hotWW)
+
+print(common_vars_hotWW)
+
+estimates_lm_hotWW <- summary(lm_hotWW)$coefficients[common_vars_hotWW, 1]
+estimates_backward_hotWW <- summary(backward_hotWW)$coefficients[common_vars_hotWW, 1]
+
+print(estimates_lm_hotWW)
+print(estimates_backward_hotWW)
+```
+```{r}
+#Common Results Backward Hot
+
+common_vars_hotWD_coolWW <- intersect(vars_lm_hotWW, vars_lm_coolWW)
+
+print(common_vars_hotWD_coolWW)
+
+estimateshotWW <- summary(lm_hotWW)$coefficients[common_vars_hotWD_coolWW, 1]
+estimatescoolWW <- summary(lm_coolWW)$coefficients[common_vars_hotWD_coolWW, 1]
+
+print(estimateshotWW)
+print(estimatescoolWW)
+```
+
+#REGRESSION ON SUBSETS - HotWD_1
+
+```{r}
+#Standard Regression HotWD_1
+
+lm_hotWD_1<-lm(grain.number~ ., data = hot_WD_1)
+summary(lm_hotWD_1, vcoc=vcovHC)
+
+#Graphs
+plot(hot_WD_1$grain.number, lm_hotWD_1$fitted.values, ylab = "Fitted Values", xlab = "Grain Number")
+abline(0,1, col="red")
+plot(lm_hotWD_1$residuals, ylab = "Residuals")
+abline(0,0, col="red")
+plot(hot_WD_1$grain.number, lm_hotWD_1$residuals, ylab = "Residuals", xlab = "Grain Number")
+abline(0,0, col="red")
+```
+MODEL DOESN'T FIT
+
+```{r}
+#Lasso on HotWD_1
+
+#Variables definition
+target_hotWD_1 <- as.numeric(hot_WD_1$grain.number)
+SNPs_hotWD_1 <- hot_WD_1[, -which(names(hot_WD_1) == "grain.number")]
+SNPs_hotWD_1<-as.matrix(SNPs_hotWD_1)
+
+#Lasso and Cross-validation
+cv_model_hotWD_1 <- cv.glmnet(SNPs_hotWD_1, target_hotWD_1, alpha = 1)
+best_lambda_hotWD_1 <- cv_model_hotWD_1$lambda.min
+print(best_lambda_hotWD_1)
+
+#Results
+best_coef_hotWD_1 <- coef(cv_model_hotWD_1, s = "lambda.min")
+print(best_coef_hotWD_1)
+
+#Graphs
+predicted_values_hotWD_1 <- predict(cv_model_hotWD_1, newx = SNPs_hotWD_1, s = "lambda.min")
+residuals_hotWD_1 <- target_hotWD_1 - predicted_values_hotWD_1
+plot(residuals_hotWD_1, main = "Residuals of Lasso Model", ylab = "Residuals", xlab = "Index")
+abline(h = 0, col = "red")
+plot(target_hotWD_1, predicted_values_hotWD_1, main = "Fitted of Lasso Model", ylab = "Residuals", xlab = "Target")
+abline(0, 1, col = "red")
+plot(target_hotWD_1, residuals_hotWD_1, main = "Residuals of Lasso Model", ylab = "Residuals", xlab = "Index")
+abline(h = 0, col = "red")
+
+```
+LASSO FITTA POCO E RESIDUI MOLTO LINEARI
+
+```{r}
+#Dataset hotWD_1 reduction for lasso
+
+selected_variables_hotWD_1 <- rownames(best_coef_hotWD_1)[best_coef_hotWD_1[, 1] != 0]
+selected_variables_hotWD_1 <- selected_variables_hotWD_1[selected_variables_hotWD_1 != "(Intercept)"]
+
+hot_WD_1 <- hot_WD_1[, c("grain.number", selected_variables_hotWD_1)]
+```
+
+
+```{r}
+#Standard Regression on reduced hotWD_1
+
+lm_new_hotWD_1<-lm(grain.number~ ., data = hot_WD_1)
+summary(lm_new_hotWD_1, vcoc=vcovHC)
+
+#Graphs
+plot(hot_WD_1$grain.number, lm_new_hotWD_1$fitted.values)
+abline(0,1, col="red")
+plot(lm_new_hotWD_1$residuals)
+abline(0,0, col="red")
+plot(hot_WD_1$grain.number, lm_new_hotWD_1$residuals)
+abline(0,0, col="red")
+```
+
+
+```{r}
+#Backward hotWD_1
+backward_hotWD_1 <- step(lm_new_hotWD_1, direction="backward")
+summary(backward_hotWD_1, vcov=vcovHC)
+
+#Graphs
+plot(hot_WD_1$grain.number, backward_hotWD_1$fitted.values, ylab = "Fitted Values", xlab = "Grain Number")
+abline(0,1, col="red")
+plot(backward_hotWD_1$residuals, ylab = "Residuals")
+abline(0,0, col="red")
+plot(hot_WD_1$grain.number, backward_hotWD_1$residuals, ylab = "Residuals", xlab = "Grain Number")
+abline(0,0, col="red")
+```
+Fitta sempre male ma meglio: Adjusted R2=0.211
+Residui sempre lineari
+
+
+```{r}
+#Forward hotWD
+
+forward_hotWD_1 <- step(lm_new_hotWD_1, direction="forward")
+summary(forward_hotWD_1, vcov=vcovHC)
+
+#Graphs
+plot(hot_WD_1$grain.number, forward_hotWD_1$fitted.values)
+abline(0,1, col="red")
+plot(forward_hotWD_1$residuals)
+abline(0,0, col="red")
+plot(hot_WD_1$grain.number, forward_hotWD_1$residuals)
+abline(0,0, col="red")
+```
+RISULTATI PEGGIO DI BACKWARD
+
+```{r}
+#Stepwise hotWD_1
+
+step_hotWD_1 <- step(lm_new_hotWD_1, direction="both")
+summary(step_hotWD_1, vcov=vcovHC)
+
+#Graphs
+plot(hot_WD_1$grain.number, step_hotWD_1$fitted.values)
+abline(0,1, col="red")
+plot(step_hotWD_1$residuals)
+abline(0,0, col="red")
+plot(hot_WD_1$grain.number, step_hotWD_1$residuals)
+abline(0,0, col="red")
+```
+Same results as backward
+
+```{r}
+#Common Results Backward and Standard Linear Model
+
+# P-values
+
+pvalues_lm_hotWD_1 <- summary(lm_hotWD_1)$coefficients[, 4]
+pvalues_backward_hotWD_1 <- summary(backward_hotWD_1)$coefficients[, 4]
+
+# Variables selection
+vars_lm_hotWD_1 <- names(pvalues_lm_hotWD_1)[pvalues_lm_hotWD_1 < 0.05]
+vars_backward_hotWD_1 <- names(pvalues_backward_hotWD_1)[pvalues_backward_hotWD_1 < 0.05]
+
+# Common Variables
+common_vars_hotWD_1 <- intersect(vars_lm_hotWD_1, vars_backward_hotWD_1)
+
+print(common_vars_hotWD_1)
+
+estimates_lm_hotWD_1 <- summary(lm_hotWD_1)$coefficients[common_vars_hotWD_1, 1]
+estimates_backward_hotWD_1 <- summary(backward_hotWD_1)$coefficients[common_vars_hotWD_1, 1]
+
+print(estimates_lm_hotWD_1)
+print(estimates_backward_hotWD_1)
+```
+
+#REGRESSION ON SUBSETS - HotWD_2
+
+```{r}
+#Standard Regression HotWD_2
+
+lm_hotWD_2<-lm(grain.number~ ., data = hot_WD_2)
+summary(lm_hotWD_2, vcoc=vcovHC)
+
+#Graphs
+plot(hot_WD_2$grain.number, lm_hotWD_2$fitted.values, ylab = "Fitted Values", xlab = "Grain Number")
+abline(0,1, col="red")
+plot(lm_hotWD_2$residuals, ylab = "Residuals")
+abline(0,0, col="red")
+plot(hot_WD_2$grain.number, lm_hotWD_2$residuals, ylab = "Residuals", xlab = "Grain Number")
+abline(0,0, col="red")
+```
+
+Adjusted R2: 0.1792, but residuals not too bad
+
+
+```{r}
+#Lasso on HotWD_2
+
+#Variables definition
+target_hotWD_2 <- as.numeric(hot_WD_2$grain.number)
+SNPs_hotWD_2 <- hot_WD_2[, -which(names(hot_WD_2) == "grain.number")]
+SNPs_hotWD_2<-as.matrix(SNPs_hotWD_2)
+
+#Lasso and Cross-validation
+cv_model_hotWD_2 <- cv.glmnet(SNPs_hotWD_2, target_hotWD_2, alpha = 1)
+best_lambda_hotWD_2 <- cv_model_hotWD_2$lambda.min
+print(best_lambda_hotWD_2)
+
+#Results
+best_coef_hotWD_2 <- coef(cv_model_hotWD_2, s = "lambda.min")
+print(best_coef_hotWD_2)
+
+#Graphs
+predicted_values_hotWD_2 <- predict(cv_model_hotWD_2, newx = SNPs_hotWD_2, s = "lambda.min")
+residuals_hotWD_2 <- target_hotWD_2 - predicted_values_hotWD_2
+plot(residuals_hotWD_2, main = "Residuals of Lasso Model", ylab = "Residuals", xlab = "Index")
+abline(h = 0, col = "red")
+plot(target_hotWD_2, predicted_values_hotWD_2, main = "Fitted of Lasso Model", ylab = "Residuals", xlab = "Target")
+abline(0, 1, col = "red")
+plot(target_hotWD_2, residuals_hotWD_2, main = "Residuals of Lasso Model", ylab = "Residuals", xlab = "Index")
+abline(h = 0, col = "red")
+
+```
+LINEARITY IN ERRORS E NON FITTA
+
+```{r}
+#Dataset hotWD_2 reduction for lasso
+
+selected_variables_hotWD_2 <- rownames(best_coef_hotWD_2)[best_coef_hotWD_2[, 1] != 0]
+selected_variables_hotWD_2 <- selected_variables_hotWD_2[selected_variables_hotWD_2 != "(Intercept)"]
+
+hot_WD_2 <- hot_WD_2[, c("grain.number", selected_variables_hotWD_2)]
+```
+
+
+```{r}
+#Standard Regression on reduced hotWD_2
+
+lm_new_hotWD_2<-lm(grain.number~ ., data = hot_WD_2)
+summary(lm_new_hotWD_2, vcoc=vcovHC)
+
+#Graphs
+plot(hot_WD_2$grain.number, lm_new_hotWD_2$fitted.values)
+abline(0,1, col="red")
+plot(lm_new_hotWD_2$residuals)
+abline(0,0, col="red")
+plot(hot_WD_2$grain.number, lm_new_hotWD_2$residuals)
+abline(0,0, col="red")
+```
+NON FITTA, ADJUSTED R2: 0.2845
+```{r}
+#Backward hotWD_2
+backward_hotWD_2 <- step(lm_new_hotWD_2, direction="backward")
+summary(backward_hotWD_2, vcov=vcovHC)
+
+#Graphs
+plot(hot_WD_2$grain.number, backward_hotWD_2$fitted.values, ylab = "Fitted Values", xlab = "Grain Number")
+abline(0,1, col="red")
+plot(backward_hotWD_2$residuals, ylab = "Residuals")
+abline(0,0, col="red")
+plot(hot_WD_2$grain.number, backward_hotWD_2$residuals, ylab = "Residuals", xlab = "Grain Number")
+abline(0,0, col="red")
+```
+UN FILO MEGLIO MA PENSO CI SIA UN PROBLEMA DI MODELLO PER QUESTI VALORI
+
+```{r}
+#Forward hotWD_2
+forward_hotWD_2 <- step(lm_new_hotWD_2, direction="forward")
+summary(forward_hotWD_2, vcov=vcovHC)
+
+#Graphs
+plot(hot_WD_2$grain.number, forward_hotWD_2$fitted.values)
+abline(0,1, col="red")
+plot(forward_hotWD_2$residuals)
+abline(0,0, col="red")
+plot(hot_WD_2$grain.number, forward_hotWD_2$residuals)
+abline(0,0, col="red")
+```
+
+```{r}
+#Step hotWD_2
+step_hotWD_2 <- step(lm_new_hotWD_2, direction="both")
+summary(step_hotWD_2, vcov=vcovHC)
+
+#Graphs
+plot(hot_WD_2$grain.number, step_hotWD_2$fitted.values)
+abline(0,1, col="red")
+plot(step_hotWD_2$residuals)
+abline(0,0, col="red")
+plot(hot_WD_2$grain.number, step_hotWD_2$residuals)
+abline(0,0, col="red")
+```
+SAME RESULTS AS BACKWARD
+
+```{r}
+#Common Results Backward and Standard Linear Model
+
+# P-values
+
+pvalues_lm_hotWD_2 <- summary(lm_hotWD_2)$coefficients[, 4]
+pvalues_backward_hotWD_2 <- summary(backward_hotWD_2)$coefficients[, 4]
+
+# Variables selection
+vars_lm_hotWD_2 <- names(pvalues_lm_hotWD_2)[pvalues_lm_hotWD_2 < 0.05]
+vars_backward_hotWD_2 <- names(pvalues_backward_hotWD_2)[pvalues_backward_hotWD_2 < 0.05]
+
+# Common Variables
+common_vars_hotWD_2 <- intersect(vars_lm_hotWD_2, vars_backward_hotWD_2)
+
+print(common_vars_hotWD_2)
+
+estimates_lm_hotWD_2 <- summary(lm_hotWD_2)$coefficients[common_vars_hotWD_2, 1]
+estimates_backward_hotWD_2 <- summary(backward_hotWD_2)$coefficients[common_vars_hotWD_2, 1]
+
+print(estimates_lm_hotWD_2)
+print(estimates_backward_hotWD_2)
+```
+
+```{r}
+#Common Results Backward Hot
+
+common_vars_hotWD <- intersect(vars_lm_hotWD_2, vars_lm_hotWD_1)
+
+print(common_vars_hotWD)
+
+estimates_hotWD_2 <- summary(lm_hotWD_2)$coefficients[common_vars_hotWD_2, 1]
+estimates_hotWD_1 <- summary(lm_hotWD_1)$coefficients[common_vars_hotWD_2, 1]
+
+print(estimates_lm_hotWD_2)
+print(estimates_backward_hotWD_2)
+```
+#ELASTICNET
+
+```{r}
+#Rebuild sets as before of the Lasso regression
+
+SNPs_coolWW <- CoolWW_set[, 6:41725]
+env_var_coolWW <- CoolWW_set[, 3:4]  
+target_coolWW <- CoolWW_set$grain.number
+
+SNPs_hotWW <- HotWW_set[, 6:41725]
+env_var_hotWW <- HotWW_set[, 3:4]  
+target_hotWW <- HotWW_set$grain.number
+
+SNPs_hotWD_1 <- HotWD_set_1[, 6:41725]
+env_var_hotWD_1 <- HotWD_set_1[, 3:4]  
+target_hotWD_1 <- HotWD_set_1$grain.number
+
+SNPs_hotWD_2 <- HotWD_set_2[, 6:41725]
+env_var_hotWD_2 <- HotWD_set_2[, 3:4]  
+target_hotWD_2 <- HotWD_set_2$grain.number
+
+cool_WW<-select_snps(SNPs_coolWW, target_coolWW)
+hot_WW<-select_snps(SNPs_hotWW, target_hotWW)
+hot_WD_1<-select_snps(SNPs_hotWD_1, target_hotWD_1)
+hot_WD_2<-select_snps(SNPs_hotWD_2, target_hotWD_2)
+
+
+perform_elastic_net_all_vars <- function(data, target_var, alpha_value = 0.5) {
+ 
+  x <- as.matrix(data[, -which(names(data) == target_var)]) 
+  y <- data[[target_var]]
+  
+  elastic_net_model <- cv.glmnet(x, y, alpha = alpha_value, family = "gaussian", type.measure = "mse")
+  
+  plot(elastic_net_model)
+  
+  return(elastic_net_model)
+}
+
+# ElastiNet for all the subdatasets
+
+elasticnet_coolWW <- perform_elastic_net_all_vars(cool_WW, "grain.number", alpha_value = 0.5)
+elasticnet_hotWW <- perform_elastic_net_all_vars(hot_WW, "grain.number", alpha_value = 0.5)
+elasticnet_hotWD_1 <- perform_elastic_net_all_vars(hot_WD_1, "grain.number", alpha_value = 0.5)
+elasticnet_hotWD_2 <- perform_elastic_net_all_vars(hot_WD_2, "grain.number", alpha_value = 0.5)
+```
+
+
+```{r}
+#Elasticnet Analysis Cool
+
+coef_elasticnet_coolWW <- coef(elasticnet_coolWW, s = "lambda.min")
+
+coef_values_coolWW <- as.numeric(coef_elasticnet_coolWW)
+coef_names_coolWW <- rownames(coef_elasticnet_coolWW)
+
+#Variable selection
+
+elastic_variables_coolWW <- rownames(coef_elasticnet_coolWW)[coef_elasticnet_coolWW[, 1] != 0]
+elastic_variables_coolWW <- elastic_variables_coolWW[elastic_variables_coolWW != "(Intercept)"]
+
+cool_WW <- cool_WW[, c("grain.number", elastic_variables_coolWW)]
+
+# Linear Regression
+elasticlm_coolWW<- lm(grain.number~ ., data = cool_WW)
+summary(elasticlm_coolWW, vcov=vcovHC)
+  
+# Backward Regression
+backward_elastic_coolWW <- step(elasticlm_coolWW, direction = "backward")
+summary(backward_elastic_coolWW, vcov=vcovHC)
+
+plot(cool_WW$grain.number, backward_elastic_coolWW$fitted.values)
+abline(0,1, col='red')
+plot(backward_elastic_coolWW$residuals)
+abline(0, 0, col='red')
+plot(cool_WW$grain.number, backward_elastic_coolWW$residuals)
+abline(0, 0, col='red')
+```
+```{r}
+#Elasticnet Analysis HotWW
+
+coef_elasticnet_hotWW <- coef(elasticnet_hotWW, s = "lambda.min")
+
+coef_values_hotWW <- as.numeric(coef_elasticnet_hotWW)
+coef_names_hotWW <- rownames(coef_elasticnet_hotWW)
+
+#Variable selection
+
+elastic_variables_hotWW <- rownames(coef_elasticnet_hotWW)[coef_elasticnet_hotWW[, 1] != 0]
+elastic_variables_hotWW <- elastic_variables_hotWW[elastic_variables_hotWW != "(Intercept)"]
+
+hot_WW <- hot_WW[, c("grain.number", elastic_variables_hotWW)]
+
+# Linear Regression
+elasticlm_hotWW<- lm(grain.number~ ., data = hot_WW)
+summary(elasticlm_hotWW, vcov=vcovHC)
+  
+# Backward Regression
+backward_elastic_hotWW <- step(elasticlm_hotWW, direction = "backward")
+summary(backward_elastic_hotWW, vcov=vcovHC)
+
+plot(hot_WW$grain.number, backward_elastic_hotWW$fitted.values)
+abline(0,1, col='red')
+plot(backward_elastic_hotWW$residuals)
+abline(0, 0, col='red')
+plot(hot_WW$grain.number, backward_elastic_hotWW$residuals)
+abline(0, 0, col='red')
+```
+
+```{r}
+#Elasticnet Analysis HotWD_1
+
+coef_elasticnet_hotWD_1 <- coef(elasticnet_hotWD_1, s = "lambda.min")
+
+coef_values_hotWD_1 <- as.numeric(coef_elasticnet_hotWD_1)
+coef_names_hotWD_1 <- rownames(coef_elasticnet_hotWD_1)
+
+#Variable selection
+
+elastic_variables_hotWD_1 <- rownames(coef_elasticnet_hotWD_1)[coef_elasticnet_hotWD_1[, 1] != 0]
+elastic_variables_hotWD_1 <- elastic_variables_hotWD_1[elastic_variables_hotWD_1 != "(Intercept)"]
+
+hot_WD_1 <- hot_WD_1[, c("grain.number", elastic_variables_hotWD_1)]
+
+# Linear Regression
+elasticlm_hotWD_1<- lm(grain.number~ ., data = hot_WD_1)
+summary(elasticlm_hotWD_1, vcov=vcovHC)
+  
+# Backward Regression
+backward_elastic_hotWD_1 <- step(elasticlm_hotWD_1, direction = "backward")
+summary(backward_elastic_hotWD_1, vcov=vcovHC)
+
+plot(hot_WD_1$grain.number, backward_elastic_hotWD_1$fitted.values)
+abline(0,1, col='red')
+plot(backward_elastic_hotWD_1$residuals)
+abline(0, 0, col='red')
+plot(hot_WD_1$grain.number, backward_elastic_hotWD_1$residuals)
+abline(0, 0, col='red')
+```
+```{r}
+#Elasticnet Analysis HotWD_2
+
+coef_elasticnet_hotWD_2 <- coef(elasticnet_hotWD_2, s = "lambda.min")
+
+coef_values_hotWD_2 <- as.numeric(coef_elasticnet_hotWD_2)
+coef_names_hotWD_2 <- rownames(coef_elasticnet_hotWD_2)
+
+#Variable selection
+
+elastic_variables_hotWD_2 <- rownames(coef_elasticnet_hotWD_2)[coef_elasticnet_hotWD_2[, 1] != 0]
+elastic_variables_hotWD_2 <- elastic_variables_hotWD_2[elastic_variables_hotWD_2 != "(Intercept)"]
+
+hot_WD_2 <- hot_WD_2[, c("grain.number", elastic_variables_hotWD_2)]
+
+# Linear Regression
+elasticlm_hotWD_2<- lm(grain.number~ ., data = hot_WD_2)
+summary(elasticlm_hotWD_2, vcov=vcovHC)
+  
+# Backward Regression
+backward_elastic_hotWD_2 <- step(elasticlm_hotWD_2, direction = "backward")
+summary(backward_elastic_hotWD_2, vcov=vcovHC)
+
+plot(hot_WD_2$grain.number, backward_elastic_hotWD_2$fitted.values)
+abline(0,1, col='red')
+plot(backward_elastic_hotWD_2$residuals)
+abline(0, 0, col='red')
+plot(hot_WD_2$grain.number, backward_elastic_hotWD_2$residuals)
+abline(0, 0, col='red')
+```
